@@ -352,8 +352,14 @@ DIM_WORDS = {"region": "region", "regions": "region", "product": "product", "pro
              "buyer": "customer", "buyers": "customer", "shopper": "customer", "shoppers": "customer"}
 
 
+def neutralize_thresholds(q):
+    """'at least one', 'at most 3', 'no fewer than' ... are thresholds, not rankings."""
+    return re.sub(r"\b(at\s+(?:the\s+)?(?:very\s+)?(?:least|most)|no\s+(?:fewer|less|more)\s+than|not\s+(?:fewer|less)\s+than)\b", " THRESH ", q, flags=re.I)
+
+
 def detect_group(q, regions, products, customers):
     """Return the dimension the question asks us to rank by (region/product/customer) or None."""
+    q = neutralize_thresholds(q)
     value_spans = []
     for v in set(regions) | set(products) | set(customers):
         for m in re.finditer(r"(?<![A-Za-z0-9])" + re.escape(v.lower()) + r"(?:'?s|es)?(?![A-Za-z0-9])", q.lower()):
@@ -381,6 +387,25 @@ def detect_group(q, regions, products, customers):
     return None
 
 
+NUMW = {"one": 1, "a": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def parse_min_orders(q):
+    """'at least 3 orders', '2 or more orders', 'more than 1 order', 'repeat customers' -> minimum orders per entity."""
+    m = re.search(r"\bat\s+least\s+(\d+|" + "|".join(NUMW) + r")\b", q, re.I)
+    if m:
+        v = m[1].lower(); return int(v) if v.isdigit() else NUMW[v]
+    m = re.search(r"\b(\d+|" + "|".join(NUMW) + r")\s+or\s+more\b", q, re.I)
+    if m:
+        v = m[1].lower(); return int(v) if v.isdigit() else NUMW[v]
+    m = re.search(r"\b(?:more|greater)\s+than\s+(\d+|" + "|".join(NUMW) + r")\s+(?:\w+\s+)?orders?\b", q, re.I)
+    if m:
+        v = m[1].lower(); return (int(v) if v.isdigit() else NUMW[v]) + 1
+    if re.search(r"\b(repeat|returning|multiple|several)\b", q, re.I):
+        return 2
+    return 1
+
+
 def make_spec(q: str, orders):
     regions = {o["region"] for o in orders}
     products = {o["product"] for o in orders}
@@ -405,7 +430,7 @@ def make_spec(q: str, orders):
     if spec["group"]:
         tm = re.search(r"\b(?:top|best|bottom|worst)\s+(\d+)\b", q, re.I)
         spec["top"] = int(tm[1]) if tm else None
-        spec["order"] = "asc" if LOWEST.search(q) else "desc"
+        spec["order"] = "asc" if LOWEST.search(neutralize_thresholds(q)) else "desc"
 
     refund_q = has(q, r"\brefund")
     for st in sorted(statuses, key=len, reverse=True):
@@ -434,8 +459,12 @@ def make_spec(q: str, orders):
         spec["metric"] = "rate"
     elif has(q, r"\b(average|avg|mean|aov)\b"):
         spec["metric"] = "avg"
-    elif has(q, r"\b(unique|distinct|different)\s+customers?\b", r"\bhow many\s+(?:\w+\s+){0,2}customers\b", r"\bnumber of\s+(?:\w+\s+){0,2}customers\b"):
-        spec["metric"] = "customers"
+    elif has(q, r"\b(unique|distinct|different)\s+(?:\w+\s+)?(customers?|products?|regions?)\b",
+             r"\bhow many\s+(?:\w+\s+){0,2}(customers|products|regions)\b", r"\bnumber of\s+(?:\w+\s+){0,2}(customers|products|regions)\b"):
+        spec["metric"] = "distinct"
+        dm = re.search(r"\b(customer|product|region)s?\b", q, re.I)
+        spec["distinct"] = dm[1].lower() if dm else "customer"
+        spec["min_orders"] = parse_min_orders(q)
     elif unit_words:
         spec["metric"] = "units"
     elif has(q, r"\bhow many\b", r"\bnumber of\b", r"\bcount\b", r"\btotal orders\b") and has(q, r"\borders?\b|\brefunds?\b|\brefunded\b"):
@@ -514,7 +543,7 @@ def measure(rows, metric):
 
 def status_for(spec):
     metric = spec["metric"]
-    if metric in ("revenue", "units", "avg", "customers"):
+    if metric in ("revenue", "units", "avg", "customers", "distinct"):
         return spec["status"] or "paid"
     if metric == "refund_total":
         return "refunded"
@@ -549,6 +578,13 @@ def run_spec(spec, orders):
             return money(d) if mm in ("revenue", "refund_total") else int(d)
         sc.sort(key=lambda kv: kv[1], reverse=(mode == "higher"))
         return sc[0][0]
+    if metric == "distinct":
+        dim = spec.get("distinct", "customer")
+        rows = select(orders, spec, status, skip=dim)
+        per = defaultdict(int)
+        for o in rows:
+            per[o[dim]] += 1
+        return sum(1 for v in per.values() if v >= spec.get("min_orders", 1))
     if metric == "rate":
         base = select(orders, spec, None)
         part = [o for o in base if o["status"] == (spec["status"] or "refunded")]
@@ -587,6 +623,10 @@ async def llm_spec(q, orders):
 async def answer_question(q: str):
     orders = await load_data()
     spec = make_spec(q, orders)
+    # "How many ..." / "How much ..." always asks for a number, never a name: undo any accidental ranking
+    if spec.get("group") and re.match(r"\s*(how\s+many|how\s+much|what\s+(?:is|was|were)\s+the\s+(?:total|average|number|combined|sum))\b", q, re.I) \
+            and not re.search(r"\b(top|best|highest|lowest|worst|leading)\b", neutralize_thresholds(q), re.I):
+        spec = dict(spec, group=None, top=None)
     try:
         return run_spec(spec, orders), spec
     except Exception:
