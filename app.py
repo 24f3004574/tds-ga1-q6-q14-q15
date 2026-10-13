@@ -342,6 +342,45 @@ def has(q, *pats):
     return any(re.search(p, q, re.I) for p in pats)
 
 
+SUPERLATIVE = re.compile(
+    r"\b(top|best|highest|most|largest|biggest|lowest|least|worst|smallest|leading|bottom|fewest|greatest|"
+    r"maximum|minimum|max|min|number one|top-?sell\w*|best-?sell\w*|#1)\b|#1", re.I)
+LOWEST = re.compile(r"\b(lowest|least|worst|smallest|bottom|fewest|minimum|min|weakest|lowest-?\w*)\b", re.I)
+DIM_WORDS = {"region": "region", "regions": "region", "product": "product", "products": "product",
+             "item": "product", "items": "product", "appliance": "product", "appliances": "product",
+             "customer": "customer", "customers": "customer", "client": "customer", "clients": "customer",
+             "buyer": "customer", "buyers": "customer", "shopper": "customer", "shoppers": "customer"}
+
+
+def detect_group(q, regions, products, customers):
+    """Return the dimension the question asks us to rank by (region/product/customer) or None."""
+    value_spans = []
+    for v in set(regions) | set(products) | set(customers):
+        for m in re.finditer(r"(?<![A-Za-z0-9])" + re.escape(v.lower()) + r"(?:'?s|es)?(?![A-Za-z0-9])", q.lower()):
+            value_spans.append((m.start(), m.end()))
+    nouns = []
+    for m in re.finditer(r"\b(" + "|".join(sorted(DIM_WORDS, key=len, reverse=True)) + r")\b", q, re.I):
+        before = q[:m.start()].rstrip()
+        is_filter = any(abs(e - len(before)) <= 1 for _, e in value_spans)      # e.g. "North region", "Blender product"
+        nouns.append((m.start(), DIM_WORDS[m[1].lower()], is_filter))
+    sup = SUPERLATIVE.search(q)
+    wh = re.search(r"\b(which|what|who|whom)\b", q, re.I)
+    if re.search(r"\bwho\b|\bwhom\b", q, re.I) and not nouns:
+        return "customer"
+    free = [n for n in nouns if not n[2]]
+    if not free:
+        return None
+    if sup:
+        after = [n for n in free if n[0] >= sup.start()]
+        return (after or free)[0][1]
+    # "which product ..." / "what region ..." without an explicit superlative still asks for a name
+    if wh:
+        for n in free:
+            if 0 <= n[0] - wh.end() <= 25:
+                return n[1]
+    return None
+
+
 def make_spec(q: str, orders):
     regions = {o["region"] for o in orders}
     products = {o["product"] for o in orders}
@@ -350,62 +389,76 @@ def make_spec(q: str, orders):
     years = [o["created_at"].year for o in orders]
     default_year = max(set(years), key=years.count) if years else 2026
 
-    spec = {"region": None, "product": None, "customer": None, "status": None,
-            "range": parse_time(q, default_year), "group": None, "top": None, "metric": None}
+    spec = {"region": None, "product": None, "customer": None, "regions": [], "products": [], "customers": [],
+            "status": None, "range": parse_time(q, default_year), "group": None, "top": None, "metric": None,
+            "compare": None}
 
-    # entities
-    cust = re.findall(r"\bC\d{3,6}\b", q, re.I)
-    spec["customer"] = (find_mentions(q, customers) or [c.upper() for c in cust] or [None])[0]
-    prods = find_mentions(q, products)
-    regs = find_mentions(q, regions)
-    spec["product"] = prods[0] if prods else None
-    spec["region"] = regs[0] if regs else None
+    cust_ids = [c.upper() for c in re.findall(r"\bC\d{3,6}\b", q, re.I)]
+    spec["customers"] = find_mentions(q, customers) or cust_ids
+    spec["products"] = find_mentions(q, products)
+    spec["regions"] = find_mentions(q, regions)
+    spec["customer"] = spec["customers"][0] if spec["customers"] else None
+    spec["product"] = spec["products"][0] if spec["products"] else None
+    spec["region"] = spec["regions"][0] if spec["regions"] else None
 
-    # grouping / ranking
-    gm = re.search(r"\b(which|what|who|whom|top|best|highest|most|largest|biggest|lowest|least|worst|smallest)\b(?:\s+\w+){0,3}?\s+(region|product|customer|client|buyer)s?\b", q, re.I)
-    if gm:
-        spec["group"] = {"client": "customer", "buyer": "customer"}.get(gm[2].lower(), gm[2].lower())
-    elif re.search(r"\b(who)\b", q, re.I):
-        spec["group"] = "customer"
+    spec["group"] = detect_group(q, regions, products, customers)
     if spec["group"]:
         tm = re.search(r"\b(?:top|best|bottom|worst)\s+(\d+)\b", q, re.I)
         spec["top"] = int(tm[1]) if tm else None
-        spec["order"] = "asc" if re.search(r"\b(lowest|least|worst|smallest|bottom|fewest)\b", q, re.I) else "desc"
-        if spec["group"] == "region" and spec["region"] and not re.search(r"\b(other|than|besides|except)\b", q, re.I):
-            pass
+        spec["order"] = "asc" if LOWEST.search(q) else "desc"
 
-    # status filter
     refund_q = has(q, r"\brefund")
-    for s in sorted(statuses, key=len, reverse=True):
-        if s and re.search(rf"\b{re.escape(s)}\b", q, re.I):
-            spec["status"] = s
+    for st in sorted(statuses, key=len, reverse=True):
+        if st and re.search(rf"\b{re.escape(st)}\b", q, re.I):
+            spec["status"] = st
             break
     if refund_q and "refunded" in statuses:
         spec["status"] = "refunded"
 
-    # metric
-    if has(q, r"\b(rate|percent|percentage|proportion|share|ratio)\b", r"%"):
+    rev_words = has(q, r"\brevenue\b", r"\bsales\b", r"\bearn", r"\bgross\b", r"\bturnover\b", r"\bspent\b|\bspend\b|\bspending\b",
+                    r"\bgenerat", r"\bincome\b", r"\bvalue\b", r"\bamount\b", r"\busd\b", r"\$", r"\bbrought in\b", r"\bmade\b")
+    unit_words = has(q, r"\b(units?|quantity|quantities|pieces)\b", r"\bhow many\s+(?:\w+\s+){0,3}(?:were\s+)?sold\b")
+    order_words = has(q, r"\borders?\b")
+    if spec["group"]:
+        if refund_q:
+            spec["metric"] = "refund_total" if rev_words else "count"
+        elif unit_words:
+            spec["metric"] = "units"
+        elif rev_words:
+            spec["metric"] = "revenue"
+        elif order_words:
+            spec["metric"] = "count"
+        else:
+            spec["metric"] = "revenue"
+    elif has(q, r"\b(rate|percent|percentage|proportion|share|ratio)\b", r"%"):
         spec["metric"] = "rate"
     elif has(q, r"\b(average|avg|mean|aov)\b"):
         spec["metric"] = "avg"
     elif has(q, r"\b(unique|distinct|different)\s+customers?\b", r"\bhow many\s+(?:\w+\s+){0,2}customers\b", r"\bnumber of\s+(?:\w+\s+){0,2}customers\b"):
         spec["metric"] = "customers"
-    elif has(q, r"\b(units?|quantity|quantities|pieces|items)\b", r"\bhow many\s+(?:\w+\s+){0,3}(?:were\s+)?sold\b"):
+    elif unit_words:
         spec["metric"] = "units"
     elif has(q, r"\bhow many\b", r"\bnumber of\b", r"\bcount\b", r"\btotal orders\b") and has(q, r"\borders?\b|\brefunds?\b|\brefunded\b"):
         spec["metric"] = "count"
     elif refund_q and has(q, r"\bhow much\b", r"\bvalue\b", r"\bamount\b", r"\bworth\b", r"\busd\b", r"\btotal\b", r"\bsum\b", r"\$"):
         spec["metric"] = "refund_total"
-    elif has(q, r"\brevenue\b", r"\bsales\b", r"\bearn", r"\bgross\b", r"\bturnover\b", r"\bspent\b|\bspend\b", r"\bgenerat", r"\bhow much\b", r"\bincome\b"):
+    elif rev_words or has(q, r"\bhow much\b"):
         spec["metric"] = "revenue"
     elif refund_q:
         spec["metric"] = "count"
     else:
         spec["metric"] = "revenue"
-    if spec["group"] and spec["metric"] in ("avg", "customers", "rate"):
-        pass
-    if spec["group"] and spec["metric"] == "count" and not has(q, r"\bhow many\b", r"\bnumber of\b"):
-        spec["metric"] = "count"
+
+    # head-to-head: "which had higher revenue, North or South?" / "how much more ... than ..."
+    dim = None
+    for d, key in (("region", "regions"), ("product", "products"), ("customer", "customers")):
+        if len(spec[key]) >= 2:
+            dim = d
+    if dim and has(q, r"\b(or|vs\.?|versus|compared|than|difference|between)\b") and not spec["group"]:
+        if has(q, r"\bdifference\b", r"\bhow much (more|less|higher|lower)\b", r"\bgap\b"):
+            spec["compare"] = (dim, "diff")
+        elif has(q, r"\b(higher|more|greater|larger|bigger|better|lower|less|fewer|smaller|worse|beat|beats|outsold|outsell|outperform\w*)\b", r"\bwhich\b"):
+            spec["compare"] = (dim, "lower" if has(q, r"\b(lower|less|fewer|smaller|worse)\b") else "higher")
     return spec
 
 
@@ -414,18 +467,27 @@ def in_range(o, spec, field):
     r = spec["range"]
     if not r:
         return True
-    t = o[field]
-    return r[0] <= t < r[1]
+    return r[0] <= o[field] < r[1]
 
 
-def select(orders, spec, status):
+def _match(o, spec, key, field, skip):
+    vals = spec.get(key + "s") or ([spec[key]] if spec.get(key) else [])
+    if not vals or skip == key:
+        return True
+    return o[field].lower() in {v.lower() for v in vals}
+
+
+def select(orders, spec, status, skip=None, only=None):
+    """skip: dimension we group by (not filtered); only: (dim, value) override used for head-to-head."""
     out = []
     for o in orders:
-        if spec["region"] and o["region"].lower() != spec["region"].lower() and not spec.get("_group_is_region"):
-            continue
-        if spec["product"] and o["product"].lower() != spec["product"].lower() and not spec.get("_group_is_product"):
-            continue
-        if spec["customer"] and o["customer"].lower() != spec["customer"].lower() and not spec.get("_group_is_customer"):
+        if only:
+            if o[only[0]].lower() != only[1].lower():
+                continue
+            ok = all(_match(o, spec, k, k, skip) for k in ("region", "product", "customer") if k != only[0])
+        else:
+            ok = all(_match(o, spec, k, k, skip) for k in ("region", "product", "customer"))
+        if not ok:
             continue
         if status and o["status"] != status:
             continue
@@ -441,7 +503,7 @@ def money(x):
 
 
 def measure(rows, metric):
-    if metric == "revenue" or metric == "refund_total":
+    if metric in ("revenue", "refund_total"):
         return sum(o["usd"] for o in rows)
     if metric == "units":
         return sum(o["qty"] for o in rows)
@@ -450,22 +512,21 @@ def measure(rows, metric):
     return len(rows)
 
 
+def status_for(spec):
+    metric = spec["metric"]
+    if metric in ("revenue", "units", "avg", "customers"):
+        return spec["status"] or "paid"
+    if metric == "refund_total":
+        return "refunded"
+    return spec["status"]
+
+
 def run_spec(spec, orders):
     metric = spec["metric"]
-    if metric in ("revenue", "units", "avg"):
-        status = spec["status"] or "paid"
-    elif metric == "refund_total":
-        status = "refunded"
-    elif metric == "customers":
-        status = spec["status"] or "paid"
-    else:
-        status = spec["status"]
+    status = status_for(spec)
     grp = spec.get("group")
-    # a grouping dimension that is also given as a filter value (e.g. "North region ... which product") is fine;
-    # a dimension we group by is never filtered
     if grp:
-        spec = dict(spec); spec[f"_group_is_{grp}"] = True
-        rows = select(orders, spec, status)
+        rows = select(orders, spec, status, skip=grp)
         buckets = defaultdict(list)
         for o in rows:
             buckets[o[grp]].append(o)
@@ -478,8 +539,18 @@ def run_spec(spec, orders):
         if spec.get("top"):
             return [k for k, _ in scored[:spec["top"]]]
         return scored[0][0]
+    if spec.get("compare"):
+        dim, mode = spec["compare"]
+        vals = spec[dim + "s"][:2]
+        mm = metric if metric not in ("avg", "rate") else "revenue"
+        sc = [(v, measure(select(orders, spec, status, only=(dim, v)), mm)) for v in vals]
+        if mode == "diff":
+            d = abs(sc[0][1] - sc[1][1])
+            return money(d) if mm in ("revenue", "refund_total") else int(d)
+        sc.sort(key=lambda kv: kv[1], reverse=(mode == "higher"))
+        return sc[0][0]
     if metric == "rate":
-        base = select(orders, dict(spec), None)
+        base = select(orders, spec, None)
         part = [o for o in base if o["status"] == (spec["status"] or "refunded")]
         return round(100.0 * len(part) / len(base), 2) if base else 0
     rows = select(orders, spec, status)
@@ -508,7 +579,8 @@ async def llm_spec(q, orders):
     rng = None
     if d.get("start") and d.get("end"):
         rng = (datetime.fromisoformat(d["start"]).replace(tzinfo=IST), datetime.fromisoformat(d["end"]).replace(tzinfo=IST))
-    return {"region": d.get("region"), "product": d.get("product"), "customer": d.get("customer"), "status": d.get("status"),
+    return {"region": d.get("region"), "product": d.get("product"), "customer": d.get("customer"),
+            "regions": [], "products": [], "customers": [], "compare": None, "status": d.get("status"),
             "range": rng, "group": d.get("group"), "top": d.get("top"), "order": d.get("order") or "desc", "metric": d.get("metric") or "revenue"}
 
 
